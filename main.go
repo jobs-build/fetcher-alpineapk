@@ -194,13 +194,21 @@ func extractEntry(hdr *tar.Header, tr io.Reader, outDir string) error {
 		return os.Chmod(dst, perm)
 	case tar.TypeSymlink:
 		// Reject any symlink whose target would resolve outside outDir
-		// (Zip-Slip via symlink). Legit Alpine symlinks are same-dir relative.
+		// (Zip-Slip via symlink). Most Alpine symlinks are same-dir relative; an
+		// absolute target (e.g. gcc's "//usr/libexec/gcc/…/liblto_plugin.so")
+		// means "relative to the install root", so reinterpret it under outDir
+		// and rewrite it as a relative link — that resolves identically whether
+		// the tree is staged into / or mounted at a store path.
 		target := hdr.Linkname
-		resolved := target
-		if !filepath.IsAbs(resolved) {
-			resolved = filepath.Join(filepath.Dir(dst), resolved)
+		if filepath.IsAbs(target) {
+			rooted := filepath.Join(outDir, filepath.Clean(target))
+			rel, err := filepath.Rel(filepath.Dir(dst), rooted)
+			if err != nil {
+				return fmt.Errorf("unsafe symlink in apk: %q -> %q", hdr.Name, target)
+			}
+			target = rel
 		}
-		if !within(outDir, filepath.Clean(resolved)) {
+		if !within(outDir, filepath.Clean(filepath.Join(filepath.Dir(dst), target))) {
 			return fmt.Errorf("unsafe symlink in apk: %q -> %q", hdr.Name, target)
 		}
 		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
