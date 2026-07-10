@@ -12,7 +12,7 @@ package main
 
 import (
 	"archive/tar"
-	"bytes"
+	"bufio"
 	"compress/gzip"
 	"crypto/sha256"
 	"encoding/hex"
@@ -43,7 +43,9 @@ type params struct {
 	Sha256  string `json:"sha256"`  // hex digest of the .apk
 }
 
-const defaultMirror = "https://dl-cdn.alpinelinux.org/alpine"
+// mirror is the Alpine CDN base URL; a var so tests can point it at a local
+// server.
+var mirror = "https://dl-cdn.alpinelinux.org/alpine"
 
 func main() { os.Exit(run(os.Getenv, os.Stderr)) }
 
@@ -63,8 +65,20 @@ func run(getenv func(string) string, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "params: branch, repo, arch, name, version and sha256 are required")
 		return exitHard
 	}
-	url := fmt.Sprintf("%s/%s/%s/%s/%s-%s.apk", defaultMirror, p.Branch, p.Repo, p.Arch, p.Name, p.Version)
-	data, retryable, err := download(url)
+	url := fmt.Sprintf("%s/%s/%s/%s/%s-%s.apk", mirror, p.Branch, p.Repo, p.Arch, p.Name, p.Version)
+	// Stream the download to a temp file (hashing inline) instead of buffering
+	// it in memory — big apks (gcc, libstdc++) shouldn't balloon the import's
+	// RSS, and the import may run under a cgroup memory cap. outDir is the one
+	// dir the fetcher contract guarantees writable; the temp file is removed
+	// before exit.
+	tmp, err := os.CreateTemp(outDir, ".fetch-*.tmp")
+	if err != nil {
+		fmt.Fprintf(stderr, "temp file: %v\n", err)
+		return exitHard
+	}
+	defer os.Remove(tmp.Name())
+	defer tmp.Close()
+	got, retryable, err := download(url, tmp)
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		if retryable {
@@ -72,45 +86,48 @@ func run(getenv func(string) string, stderr io.Writer) int {
 		}
 		return exitHard
 	}
-	if sum := sha256.Sum256(data); hex.EncodeToString(sum[:]) != p.Sha256 {
-		fmt.Fprintf(stderr, "sha256 mismatch for %s: got %s want %s\n", url, hex.EncodeToString(sum[:]), p.Sha256)
+	if got != p.Sha256 {
+		fmt.Fprintf(stderr, "sha256 mismatch for %s: got %s want %s\n", url, got, p.Sha256)
 		return exitHard
 	}
-	if err := extractAPK(data, outDir); err != nil {
+	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
+		fmt.Fprintf(stderr, "seek: %v\n", err)
+		return exitHard
+	}
+	if err := extractAPK(bufio.NewReader(tmp), outDir); err != nil {
 		fmt.Fprintln(stderr, err)
 		return exitHard
 	}
 	return exitOK
 }
 
-// download fetches the .apk. The bool reports whether a failure is retryable
-// (network error, 5xx, or 429).
-func download(url string) ([]byte, bool, error) {
+// download streams the .apk into w, returning the hex sha256 of the bytes. The
+// bool reports whether a failure is retryable (network error, 5xx, or 429).
+func download(url string, w io.Writer) (string, bool, error) {
 	client := &http.Client{Timeout: 120 * time.Second}
 	resp, err := client.Get(url)
 	if err != nil {
-		return nil, true, fmt.Errorf("GET %s: %w", url, err)
+		return "", true, fmt.Errorf("GET %s: %w", url, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		retryable := resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500
-		return nil, retryable, fmt.Errorf("GET %s: status %d", url, resp.StatusCode)
+		return "", retryable, fmt.Errorf("GET %s: status %d", url, resp.StatusCode)
 	}
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, true, fmt.Errorf("read body: %w", err)
+	h := sha256.New()
+	if _, err := io.Copy(io.MultiWriter(w, h), resp.Body); err != nil {
+		return "", true, fmt.Errorf("read body: %w", err)
 	}
-	return data, false, nil
+	return hex.EncodeToString(h.Sum(nil)), false, nil
 }
 
-// extractAPK unpacks the data files of an .apk into outDir. An .apk is several
-// concatenated gzip members (signature / control / data), each an independent
-// tar archive, so we walk the gzip members one at a time (Multistream(false) +
-// Reset) and run a fresh tar reader over each. Control members (root-level
-// dotfiles: .PKGINFO, .SIGN.*, .pre/post-install, .trigger, …) are skipped;
-// everything else is the package's file tree.
-func extractAPK(data []byte, outDir string) error {
-	r := bytes.NewReader(data)
+// extractAPK unpacks the data files of an .apk read from r into outDir. An
+// .apk is several concatenated gzip members (signature / control / data), each
+// an independent tar archive, so we walk the gzip members one at a time
+// (Multistream(false) + Reset) and run a fresh tar reader over each. Control
+// members (root-level dotfiles: .PKGINFO, .SIGN.*, .pre/post-install,
+// .trigger, …) are skipped; everything else is the package's file tree.
+func extractAPK(r io.Reader, outDir string) error {
 	gz, err := gzip.NewReader(r)
 	if err != nil {
 		return fmt.Errorf("gunzip: %w", err)
